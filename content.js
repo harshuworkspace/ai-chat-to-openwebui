@@ -1,6 +1,14 @@
 /* ═══════════════════════════════════════════════════════════════
-   AI Chat → Open WebUI Importer  —  content.js  v2.5
+   AI Chat → Open WebUI Importer  —  content.js  v2.6
    Platforms : Perplexity · ChatGPT · Google Gemini · Claude
+
+   KEY FIX (v2.6): Perplexity virtualises its chat — it mounts ~12
+   messages at a time and DESTROYS the ones that scroll out of view.
+   We now attach a MutationObserver BEFORE scrolling starts and
+   snapshot every .prose node the instant it appears in the DOM,
+   storing { html, query, sources } in a Map keyed by a short text
+   fingerprint.  This means we capture every message regardless of
+   whether it is still in the DOM when we finally read the page.
    ═══════════════════════════════════════════════════════════════ */
 
 /* ─── Platform Detection ─── */
@@ -13,7 +21,6 @@ const PLATFORM = (() => {
   return null;
 })();
 
-/* ─── UUID ─── */
 function generateUUID() {
   return 'xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx'.replace(/[xy]/g, c => {
     const r = Math.random() * 16 | 0;
@@ -25,7 +32,6 @@ function generateUUID() {
    OVERLAY
    ═══════════════════════════════════════════════════════════════ */
 let _overlay = null;
-
 function showOverlay(text) {
   if (_overlay) { updateOverlay(text); return; }
   _overlay = document.createElement('div');
@@ -59,25 +65,12 @@ function updateOverlay(text, pct) {
 function hideOverlay() { if (_overlay) { _overlay.remove(); _overlay = null; } }
 
 /* ═══════════════════════════════════════════════════════════════
-   SAFE SCROLL — never crashes, always scrolls something
-
-   Strategy (tried in order, all at once):
-   1. window.scrollTo()        ← works when html/body is the scroller
-   2. document.documentElement.scrollTop  ← legacy IE / quirks-mode
-   3. document.body.scrollTop  ← quirks-mode fallback
-   4. Walk up from .prose and set scrollTop on every overflow ancestor
-      (handles Perplexity’s deep nested scroll container)
+   SAFE SCROLL
    ═══════════════════════════════════════════════════════════════ */
-
 function safeScrollTo(top) {
-  /* 1. window */
   try { window.scrollTo({ top, behavior: 'smooth' }); } catch (_) {}
-
-  /* 2. html + body scrollTop (instant, guarantees position) */
   try { document.documentElement.scrollTop = top; } catch (_) {}
   try { document.body.scrollTop = top; } catch (_) {}
-
-  /* 3. Walk up from first .prose and scroll every overflow container */
   try {
     const anchor = document.querySelector('.prose,[data-testid="answer-text"],[class*="answerText"]');
     if (anchor) {
@@ -86,7 +79,7 @@ function safeScrollTo(top) {
         try {
           if (el.scrollHeight > el.clientHeight + 10) {
             const ov = getComputedStyle(el).overflowY;
-            if (['auto','scroll','overlay'].includes(ov)) {
+            if (['auto', 'scroll', 'overlay'].includes(ov)) {
               el.scrollTop = top;
               try { el.scrollTo({ top, behavior: 'smooth' }); } catch (_) {}
             }
@@ -99,41 +92,93 @@ function safeScrollTo(top) {
 }
 
 function getTotalScrollHeight() {
-  return Math.max(
-    document.body.scrollHeight,
-    document.documentElement.scrollHeight,
-    ...Array.from(document.querySelectorAll('.prose,[data-testid="answer-text"]'))
-      .map(el => {
-        let p = el.parentElement, h = 0;
-        while (p && p !== document.documentElement) {
-          if (p.scrollHeight > h) h = p.scrollHeight;
-          p = p.parentElement;
-        }
-        return h;
-      })
-  );
+  let h = Math.max(document.body.scrollHeight, document.documentElement.scrollHeight);
+  try {
+    const anchor = document.querySelector('.prose,[data-testid="answer-text"]');
+    if (anchor) {
+      let el = anchor.parentElement;
+      while (el && el !== document.documentElement) {
+        if (el.scrollHeight > h) h = el.scrollHeight;
+        el = el.parentElement;
+      }
+    }
+  } catch (_) {}
+  return h;
 }
 
-function countProseNodes() {
-  return document.querySelectorAll('.prose,[data-testid="answer-text"],[class*="answerText"]').length;
+/* ═══════════════════════════════════════════════════════════════
+   VIRTUALISATION-PROOF SNAPSHOT COLLECTOR
+
+   A MutationObserver watches the whole document for any newly
+   added .prose node.  The instant one appears we:
+     1. Clone its outerHTML (captures content before unmount)
+     2. Grab the user query from the sibling above it
+     3. Grab sources from siblings around it
+   Everything is stored in _proseSnapshots (ordered Map keyed by
+   a 40-char fingerprint of the text so duplicates are skipped).
+   ═══════════════════════════════════════════════════════════════ */
+
+const _proseSnapshots = new Map(); // fingerprint → { html, query, sources, searchQueries }
+let   _snapObserver   = null;
+
+function _fingerprint(el) {
+  return (el.innerText || el.textContent || '').trim().slice(0, 40);
 }
 
+function _snapshotProseEl(el) {
+  if (!el || el.parentElement?.closest('.prose')) return; // skip nested
+  const text = (el.innerText || el.textContent || '').trim();
+  if (text.length < 10) return;
+  const fp = text.slice(0, 40);
+  if (_proseSnapshots.has(fp)) return; // already captured
+  _proseSnapshots.set(fp, {
+    html:          el.outerHTML,
+    query:         findQueryBefore(el),
+    sources:       findSourcesNear(el),
+    searchQueries: scrapeSearchQueriesNear(el),
+  });
+}
+
+function _startSnapshotObserver() {
+  if (_snapObserver) return;
+  // Immediately snapshot whatever is already in the DOM
+  document.querySelectorAll('.prose').forEach(_snapshotProseEl);
+
+  _snapObserver = new MutationObserver(mutations => {
+    for (const mut of mutations) {
+      for (const node of mut.addedNodes) {
+        if (node.nodeType !== 1) continue;
+        // The node itself might be .prose
+        if (node.classList?.contains('prose')) _snapshotProseEl(node);
+        // Or it might contain .prose children
+        node.querySelectorAll?.('.prose').forEach(_snapshotProseEl);
+      }
+    }
+  });
+  _snapObserver.observe(document.body, { childList: true, subtree: true });
+}
+
+function _stopSnapshotObserver() {
+  if (_snapObserver) { _snapObserver.disconnect(); _snapObserver = null; }
+  // Final sweep: catch anything already in DOM that the observer missed
+  document.querySelectorAll('.prose').forEach(_snapshotProseEl);
+}
+
+/* ═══════════════════════════════════════════════════════════════
+   SCROLL + LOAD
+   ═══════════════════════════════════════════════════════════════ */
 async function doOnePass(passLabel, startPct, endPct, steps, delay) {
   const sleep = ms => new Promise(r => setTimeout(r, ms));
-
   updateOverlay(`🔄 ${passLabel} — jumping to top…`, startPct);
   safeScrollTo(0);
   await sleep(1500);
-
   for (let i = 1; i <= steps; i++) {
     const pct    = Math.round(startPct + (i / steps) * (endPct - startPct));
     const target = Math.ceil((getTotalScrollHeight() / steps) * i);
-    updateOverlay(`🔄 ${passLabel} — step ${i}/${steps}`, pct);
+    updateOverlay(`🔄 ${passLabel} — step ${i}/${steps}  (⚓ ${_proseSnapshots.size} captured)`, pct);
     safeScrollTo(target);
     await sleep(delay);
   }
-
-  /* land hard at bottom */
   safeScrollTo(getTotalScrollHeight());
   await sleep(900);
 }
@@ -141,31 +186,34 @@ async function doOnePass(passLabel, startPct, endPct, steps, delay) {
 async function scrollToLoadAll() {
   const sleep = ms => new Promise(r => setTimeout(r, ms));
 
-  /* Pass 1 */
-  await doOnePass('Pass 1/2', 2, 42, 14, 650);
+  _proseSnapshots.clear(); // fresh run
+  _startSnapshotObserver();
 
-  /* DOM stability check */
-  updateOverlay('🔍 Checking DOM stability…', 44);
-  const before = countProseNodes();
-  await sleep(1300);
-  const after = countProseNodes();
+  await doOnePass('Pass 1/2', 2, 42, 16, 700);
+
+  updateOverlay(`🔍 Stability check (⚓ ${_proseSnapshots.size} so far)…`, 44);
+  const before = _proseSnapshots.size;
+  await sleep(1400);
+  const after  = _proseSnapshots.size;
   updateOverlay(
     after > before
-      ? `⚠️ ${after - before} new blocks — running pass 2…`
-      : `✅ Stable: ${after} blocks — confirming with pass 2…`,
+      ? `⚠️ ${after - before} new — running pass 2…`
+      : `✅ Stable at ${after} — confirming with pass 2…`,
     46
   );
   await sleep(500);
 
-  /* Pass 2 */
-  await doOnePass('Pass 2/2', 48, 84, 14, 580);
+  await doOnePass('Pass 2/2', 48, 84, 16, 620);
 
-  /* Final settle */
   updateOverlay('⏳ Settling…', 86);
   safeScrollTo(getTotalScrollHeight());
-  await sleep(1100);
+  await sleep(1200);
   safeScrollTo(0);
-  await sleep(500);
+  await sleep(600);
+
+  _stopSnapshotObserver();
+  updateOverlay(`✅ Captured ${_proseSnapshots.size} message blocks…`, 90);
+  await sleep(300);
 }
 
 /* ═══════════════════════════════════════════════════════════════
@@ -239,16 +287,18 @@ function htmlToMarkdown(node) {
 }
 function cleanMarkdown(md) { return md.replace(/\n{3,}/g, '\n\n').trim(); }
 
-/* ═══════════════════════════════════════════════════════════════
-   PERPLEXITY SCRAPER
-   ═══════════════════════════════════════════════════════════════ */
-async function expandAllShowMore() {
-  updateOverlay('🔍 Expanding collapsed messages…', 89);
-  const btns = Array.from(document.querySelectorAll('button'))
-    .filter(b => /^show\s*more$/i.test(b.innerText.trim()));
-  for (const b of btns) { b.click(); await new Promise(r => setTimeout(r, 80)); }
+/* Helper: parse a stored HTML snapshot string into a DOM node for htmlToMarkdown */
+function parseHTML(html) {
+  const t = document.createElement('template');
+  t.innerHTML = html;
+  return t.content.firstElementChild;
 }
 
+/* ═══════════════════════════════════════════════════════════════
+   PERPLEXITY HELPERS (query / sources / search queries)
+   These need to work both on live DOM nodes AND on cloned nodes
+   during the snapshot phase.
+   ═══════════════════════════════════════════════════════════════ */
 function isPerplexityUIText(t) {
   t = t.trim();
   return (/^reviewed?\s+\d+\s+sources?\.?$/i.test(t) || /^\d+\s+sources?\.?$/i.test(t) ||
@@ -262,11 +312,12 @@ function isPerplexityUIText(t) {
 function findQueryBefore(proseEl) {
   let cur = proseEl;
   for (let d = 0; d < 25; d++) {
-    const par = cur.parentElement; if (!par || par === document.body) break;
+    const par = cur.parentElement;
+    if (!par || par === document.body) break;
     let sib = cur.previousElementSibling;
     while (sib) {
-      if (sib.id === 'owui-btn-container') { sib = sib.previousElementSibling; continue; }
-      if (sib.querySelector('.prose') || sib.classList.contains('prose')) { sib = sib.previousElementSibling; continue; }
+      if (sib.id === 'owui-btn-container')                                 { sib = sib.previousElementSibling; continue; }
+      if (sib.querySelector('.prose') || sib.classList?.contains('prose')) { sib = sib.previousElementSibling; continue; }
       if (['BUTTON', 'NAV', 'SCRIPT', 'STYLE', 'SVG'].includes(sib.tagName)) { sib = sib.previousElementSibling; continue; }
       const text = sib.innerText?.trim() || '';
       if (isPerplexityUIText(text)) { sib = sib.previousElementSibling; continue; }
@@ -282,11 +333,12 @@ function findSourcesNear(proseEl) {
   const sources = [];
   let cur = proseEl;
   for (let d = 0; d < 10; d++) {
-    const par = cur.parentElement; if (!par || par === document.body) break;
+    const par = cur.parentElement;
+    if (!par || par === document.body) break;
     Array.from(par.children).forEach(sib => {
       if (sib === proseEl) return;
       Array.from(sib.querySelectorAll('a[href]')).forEach(a => {
-        const href = a.href, label = a.innerText.trim() || a.getAttribute('aria-label') || new URL(href).hostname;
+        const href = a.href, label = a.innerText?.trim() || a.getAttribute('aria-label') || '';
         if (href?.startsWith('http') && !href.includes('perplexity.ai') && label && !sources.find(s => s.url === href))
           sources.push({ name: label.slice(0, 80), url: href });
       });
@@ -300,10 +352,12 @@ function findSourcesNear(proseEl) {
 function scrapeSearchQueriesNear(proseEl) {
   let cur = proseEl;
   for (let d = 0; d < 20; d++) {
-    const par = cur.parentElement; if (!par || par === document.body) break;
+    const par = cur.parentElement;
+    if (!par || par === document.body) break;
     let sib = cur.previousElementSibling;
     while (sib) {
-      const qs = Array.from(sib.querySelectorAll('p.px-two')).map(e => e.textContent.trim()).filter(t => t.length > 3 && t.includes(' '));
+      const qs = Array.from(sib.querySelectorAll('p.px-two'))
+        .map(e => e.textContent.trim()).filter(t => t.length > 3 && t.includes(' '));
       if (qs.length) return qs.slice(0, 6);
       sib = sib.previousElementSibling;
     }
@@ -312,53 +366,88 @@ function scrapeSearchQueriesNear(proseEl) {
   return [];
 }
 
+async function expandAllShowMore() {
+  updateOverlay('🔍 Expanding collapsed messages…', 91);
+  const btns = Array.from(document.querySelectorAll('button'))
+    .filter(b => /^show\s*more$/i.test(b.innerText?.trim()));
+  for (const b of btns) { b.click(); await new Promise(r => setTimeout(r, 80)); }
+}
+
+/* ═══════════════════════════════════════════════════════════════
+   PERPLEXITY MAIN SCRAPER
+   Builds messages from _proseSnapshots (the complete collected set)
+   ═══════════════════════════════════════════════════════════════ */
 async function scrapePerplexity() {
   await scrollToLoadAll();
   await expandAllShowMore();
-  updateOverlay('🔄 Reading all messages…', 93);
+  // One final snapshot sweep after expand
+  document.querySelectorAll('.prose').forEach(_snapshotProseEl);
+
+  updateOverlay(`🔄 Building ${_proseSnapshots.size} messages…`, 93);
   await new Promise(r => setTimeout(r, 300));
 
-  const messages = [], now = Math.floor(Date.now() / 1000);
-  let proseEls = Array.from(document.querySelectorAll('.prose'))
-    .filter(el => el.innerText.trim().length >= 10 && !el.parentElement?.closest('.prose'));
-  if (!proseEls.length) {
+  if (_proseSnapshots.size === 0) {
+    // Fallback: try alt selectors on live DOM
     const alt = document.querySelectorAll('[data-testid="answer-text"],.answer-content,[class*="answerText"]');
     if (!alt.length) return null;
-    proseEls = Array.from(alt);
+    alt.forEach(el => {
+      const fp = (el.innerText || '').trim().slice(0, 40);
+      if (!_proseSnapshots.has(fp) && (el.innerText || '').trim().length >= 10)
+        _proseSnapshots.set(fp, { html: el.outerHTML, query: findQueryBefore(el), sources: findSourcesNear(el), searchQueries: scrapeSearchQueriesNear(el) });
+    });
   }
+
+  const messages = [], now = Math.floor(Date.now() / 1000);
   const usedQueries = new Set();
-  proseEls.forEach((prose, i) => {
-    let q = findQueryBefore(prose);
-    if (!q && i === 0) q = document.title.replace(/[-|] Perplexity.*$/i, '').trim();
+  let i = 0;
+
+  for (const snap of _proseSnapshots.values()) {
+    // Rebuild a real node from the stored HTML so htmlToMarkdown can walk it
+    const node = parseHTML(snap.html);
+    if (!node) { i++; continue; }
+
+    const q = snap.query || (i === 0 ? document.title.replace(/[-|] Perplexity.*$/i, '').trim() : null);
     if (q && !usedQueries.has(q)) {
       usedQueries.add(q);
       messages.push({ id: generateUUID(), role: 'user', content: q, timestamp: now + i * 10 });
     }
-    const sources = findSourcesNear(prose);
-    const msg = { id: generateUUID(), role: 'assistant', content: cleanMarkdown(htmlToMarkdown(prose)), timestamp: now + i * 10 + 5, done: true };
+
+    const sources = snap.sources || [];
+    const msg = {
+      id: generateUUID(), role: 'assistant',
+      content: cleanMarkdown(htmlToMarkdown(node)),
+      timestamp: now + i * 10 + 5, done: true
+    };
     if (sources.length) {
-      msg.sources = sources.map(s => ({ source: { id: s.url, name: s.url, url: s.url }, document: [s.name], metadata: [{ source: s.url }], distances: [] }));
-      const qs = scrapeSearchQueriesNear(prose);
+      msg.sources = sources.map(s => ({
+        source: { id: s.url, name: s.url, url: s.url },
+        document: [s.name], metadata: [{ source: s.url }], distances: []
+      }));
+      const qs = snap.searchQueries || [];
       msg.statusHistory = [
         { done: true, action: 'web_search', description: 'Searched {{count}} sites', urls: sources.map(s => s.url), items: sources.map(s => ({ title: s.name, url: s.url })) },
         { done: true, action: 'sources_retrieved', description: `Retrieved ${sources.length} sources`, count: sources.length },
-        ...(qs.length ? [{ done: true, action: 'web_search_queries_generated', description: 'Searching', queries: qs }]
+        ...(qs.length
+          ? [{ done: true, action: 'web_search_queries_generated', description: 'Searching', queries: qs }]
           : [{ done: true, action: 'sources_retrieved', description: `Retrieved ${sources.length} sources`, count: sources.length }])
       ];
     }
     messages.push(msg);
-  });
+    i++;
+  }
+
   return messages.length ? messages : null;
 }
 
 function scrapeModelPerplexity() {
   for (const sel of ['[data-testid="model-selector-button"]', '[data-testid="model-name"]', '.model-selector button', 'button[aria-label*="sonar" i]']) {
-    const el = document.querySelector(sel); if (el) { const t = el.innerText.trim(); if (t.length > 0 && t.length < 60) return t; }
+    const el = document.querySelector(sel);
+    if (el) { const t = el.innerText?.trim(); if (t && t.length > 0 && t.length < 60) return t; }
   }
   const kw = ['claude', 'gpt', 'sonar', 'gemini', 'llama', 'mistral', 'deepseek', 'o1', 'o3', 'turbo'];
   for (const el of Array.from(document.querySelectorAll('span,button,div')).filter(e => !e.children.length)) {
-    const t = el.innerText.trim().toLowerCase();
-    if (t.length > 2 && t.length < 60 && kw.some(k => t.includes(k))) return el.innerText.trim();
+    const t = el.innerText?.trim().toLowerCase();
+    if (t && t.length > 2 && t.length < 60 && kw.some(k => t.includes(k))) return el.innerText.trim();
   }
   return 'perplexity-sonar';
 }
@@ -380,7 +469,7 @@ function scrapeChatGPT() {
 }
 function scrapeModelChatGPT() {
   for (const sel of ['button[data-testid="model-switcher-dropdown-button"]', '[data-testid="model-name"]', 'button[aria-haspopup="menu"][class*="text-token"]']) {
-    const el = document.querySelector(sel); if (el) { const t = el.innerText.trim(); if (t.length > 0 && t.length < 60) return t; }
+    const el = document.querySelector(sel); if (el) { const t = el.innerText?.trim(); if (t && t.length < 60) return t; }
   }
   const m = document.title.match(/GPT-[\w\d.]+|o\d[\w]*/i); return m ? m[0] : 'gpt-4o';
 }
@@ -388,21 +477,21 @@ function scrapeModelChatGPT() {
 /* ════════════════════ GEMINI ════════════════════ */
 function scrapeGemini() {
   const messages = [], now = Math.floor(Date.now() / 1000);
-  const userEls = Array.from(document.querySelectorAll('user-query,[data-test-id="query-text"],.user-query-container,[class*="user-query"]'));
+  const userEls  = Array.from(document.querySelectorAll('user-query,[data-test-id="query-text"],.user-query-container,[class*="user-query"]'));
   const modelEls = Array.from(document.querySelectorAll('model-response,message-content,.response-container,[class*="response-container"]'));
   const len = Math.max(userEls.length, modelEls.length);
   for (let i = 0; i < len; i++) {
     const uEl = userEls[i], mEl = modelEls[i];
-    if (uEl) { const text = uEl.innerText.trim(); if (text) messages.push({ id: generateUUID(), role: 'user', content: text, timestamp: now + i * 20 }); }
+    if (uEl) { const text = uEl.innerText?.trim(); if (text) messages.push({ id: generateUUID(), role: 'user', content: text, timestamp: now + i * 20 }); }
     if (mEl) { const mdEl = mEl.querySelector('.markdown-main-panel,.response-content,[class*="markdown"],.formatted-text') || mEl; const content = cleanMarkdown(htmlToMarkdown(mdEl)); if (content) messages.push({ id: generateUUID(), role: 'assistant', content, timestamp: now + i * 20 + 5, done: true }); }
   }
   return messages.length ? messages : null;
 }
 function scrapeModelGemini() {
   for (const sel of ['[data-test-id="model-selector"] button', 'button[aria-label*="Gemini" i]', '[class*="model-name"]']) {
-    const el = document.querySelector(sel); if (el) { const t = el.innerText.trim(); if (t.length > 0 && t.length < 80) return t; }
+    const el = document.querySelector(sel); if (el) { const t = el.innerText?.trim(); if (t && t.length < 80) return t; }
   }
-  for (const el of Array.from(document.querySelectorAll('span,div,button')).filter(e => !e.children.length)) { const t = el.innerText.trim(); if (/^gemini[\s\-]/i.test(t) && t.length < 40) return t; }
+  for (const el of Array.from(document.querySelectorAll('span,div,button')).filter(e => !e.children.length)) { const t = el.innerText?.trim(); if (t && /^gemini[\s\-]/i.test(t) && t.length < 40) return t; }
   return 'gemini';
 }
 
@@ -410,20 +499,20 @@ function scrapeModelGemini() {
 function scrapeClaude() {
   const messages = [], now = Math.floor(Date.now() / 1000);
   const userEls = Array.from(document.querySelectorAll('[data-testid="user-message"],.human-turn,[class*="HumanMessage"]'));
-  const aiEls = Array.from(document.querySelectorAll('[data-testid="assistant-message"],.ai-turn,[class*="AssistantMessage"],.font-claude-message'));
+  const aiEls   = Array.from(document.querySelectorAll('[data-testid="assistant-message"],.ai-turn,[class*="AssistantMessage"],.font-claude-message'));
   const len = Math.max(userEls.length, aiEls.length);
   for (let i = 0; i < len; i++) {
     const uEl = userEls[i], aEl = aiEls[i];
-    if (uEl) { const text = uEl.innerText.trim(); if (text) messages.push({ id: generateUUID(), role: 'user', content: text, timestamp: now + i * 20 }); }
+    if (uEl) { const text = uEl.innerText?.trim(); if (text) messages.push({ id: generateUUID(), role: 'user', content: text, timestamp: now + i * 20 }); }
     if (aEl) { const p = aEl.querySelector('.prose,[class*="prose"],.markdown') || aEl; const content = cleanMarkdown(htmlToMarkdown(p)); if (content) messages.push({ id: generateUUID(), role: 'assistant', content, timestamp: now + i * 20 + 5, done: true }); }
   }
   return messages.length ? messages : null;
 }
 function scrapeModelClaude() {
   for (const sel of ['[data-testid="model-selector"]', 'button[aria-label*="claude" i]', '[class*="ModelName"]', 'header [class*="model"]']) {
-    const el = document.querySelector(sel); if (el) { const t = el.innerText.trim(); if (t.length > 0 && t.length < 60) return t; }
+    const el = document.querySelector(sel); if (el) { const t = el.innerText?.trim(); if (t && t.length < 60) return t; }
   }
-  for (const el of Array.from(document.querySelectorAll('span,div,button')).filter(e => !e.children.length)) { const t = el.innerText.trim(); if (/^claude[\s\-]/i.test(t) && t.length < 40) return t; }
+  for (const el of Array.from(document.querySelectorAll('span,div,button')).filter(e => !e.children.length)) { const t = el.innerText?.trim(); if (t && /^claude[\s\-]/i.test(t) && t.length < 40) return t; }
   return 'claude';
 }
 
@@ -449,21 +538,31 @@ function scrapeModelName() {
 function buildExportData(messages) {
   const modelName = scrapeModelName();
   const title = document.title.replace(/[-|]\s*(Perplexity|ChatGPT|Gemini|Claude).*$/i, '').trim() || 'Imported Chat';
-  return { chat: { id: generateUUID(), title, timestamp: Math.floor(Date.now() / 1000), models: [modelName], messages: messages.map(m => ({ ...m, ...(m.role === 'assistant' ? { model: modelName } : {}) })) }, modelName };
+  return {
+    chat: {
+      id: generateUUID(), title,
+      timestamp: Math.floor(Date.now() / 1000),
+      models: [modelName],
+      messages: messages.map(m => ({ ...m, ...(m.role === 'assistant' ? { model: modelName } : {}) }))
+    }, modelName
+  };
 }
 
 /* ═══════════════════════════════════════════════════════════════
    BUTTONS
    ═══════════════════════════════════════════════════════════════ */
 async function exportChat() {
-  showOverlay('📜 Starting — ~30s for long chats…');
+  showOverlay('📜 Starting — ~40s for long chats…');
   btn.innerText = '⏳ Loading…';
   try {
     const messages = await scrapeChat();
     updateOverlay(`✅ Found ${messages?.length ?? 0} messages — saving file…`, 98);
     await new Promise(r => setTimeout(r, 300));
     hideOverlay();
-    if (!messages || !messages.length) { alert('❌ No messages found!\n\nMake sure the full conversation is visible.'); btn.innerText = '⬇ Download JSON'; return; }
+    if (!messages || !messages.length) {
+      alert('❌ No messages found!\n\nMake sure the full conversation is visible.');
+      btn.innerText = '⬇ Download JSON'; return;
+    }
     const { chat, modelName } = buildExportData(messages);
     const blob = new Blob([JSON.stringify([chat], null, 2)], { type: 'application/json' });
     const url = URL.createObjectURL(blob), a = document.createElement('a');
@@ -471,7 +570,10 @@ async function exportChat() {
     document.body.appendChild(a); a.click(); document.body.removeChild(a); URL.revokeObjectURL(url);
     btn.innerText = `✅ ${messages.length} msgs · ${modelName}`;
     setTimeout(() => { btn.innerText = '⬇ Download JSON'; }, 3500);
-  } catch (e) { hideOverlay(); btn.innerText = '⬇ Download JSON'; alert(`❌ Export error:\n${e.message}`); }
+  } catch (e) {
+    hideOverlay(); btn.innerText = '⬇ Download JSON';
+    alert(`❌ Export error:\n${e.message}`);
+  }
 }
 
 const container = document.createElement('div');
@@ -489,10 +591,13 @@ sendBtn.onclick = async () => {
   try {
     const { owuiDomain, owuiToken } = await chrome.storage.sync.get(['owuiDomain', 'owuiToken']);
     if (!owuiDomain || !owuiToken) { alert('⚠ Open WebUI URL or API token not set!\nClick the extension icon → ⚙️ Settings.'); return; }
-    showOverlay('📜 Starting — ~30s for long chats…');
+    showOverlay('📜 Starting — ~40s for long chats…');
     sendBtn.disabled = true; sendBtn.innerText = '⏳ Loading…';
     const messages = await scrapeChat();
-    if (!messages || !messages.length) { hideOverlay(); sendBtn.disabled = false; sendBtn.innerText = '🚀 Send to Open WebUI'; alert('❌ No messages found.'); return; }
+    if (!messages || !messages.length) {
+      hideOverlay(); sendBtn.disabled = false; sendBtn.innerText = '🚀 Send to Open WebUI';
+      alert('❌ No messages found.'); return;
+    }
     updateOverlay(`✅ Found ${messages.length} messages — sending…`, 98);
     sendBtn.innerText = '⏳ Sending…';
     const { chat } = buildExportData(messages);

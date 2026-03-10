@@ -1,5 +1,5 @@
 /* ═══════════════════════════════════════════════════════════════
-   AI Chat → Open WebUI Importer  —  content.js  v2.1
+   AI Chat → Open WebUI Importer  —  content.js  v2.2
    Platforms : Perplexity · ChatGPT · Google Gemini · Claude
    ═══════════════════════════════════════════════════════════════ */
 
@@ -19,6 +19,90 @@ function generateUUID() {
     const r = Math.random() * 16 | 0;
     return (c === 'x' ? r : (r & 0x3 | 0x8)).toString(16);
   });
+}
+
+/* ═══════════════════════════════════════════════════════════════
+   OVERLAY — blocks all interaction while auto-scroll runs
+   ═══════════════════════════════════════════════════════════════ */
+
+let _overlay = null;
+
+function showOverlay(statusText) {
+  if (_overlay) { updateOverlay(statusText); return; }
+
+  _overlay = document.createElement('div');
+  _overlay.id = 'owui-overlay';
+  _overlay.style.cssText = `
+    position: fixed;
+    inset: 0;
+    z-index: 2147483647;
+    background: rgba(0, 0, 0, 0.72);
+    backdrop-filter: blur(3px);
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    gap: 18px;
+    pointer-events: all;
+    cursor: not-allowed;
+  `;
+
+  /* Spinner */
+  const spinner = document.createElement('div');
+  spinner.id = 'owui-spinner';
+  spinner.style.cssText = `
+    width: 52px; height: 52px;
+    border: 4px solid rgba(255,255,255,0.15);
+    border-top-color: #10b981;
+    border-radius: 50%;
+    animation: owui-spin 0.8s linear infinite;
+  `;
+
+  /* inject keyframes once */
+  if (!document.getElementById('owui-keyframes')) {
+    const style = document.createElement('style');
+    style.id = 'owui-keyframes';
+    style.textContent = `@keyframes owui-spin { to { transform: rotate(360deg); } }`;
+    document.head.appendChild(style);
+  }
+
+  /* Status label */
+  const label = document.createElement('div');
+  label.id = 'owui-overlay-label';
+  label.style.cssText = `
+    color: #e2e8f0;
+    font-family: -apple-system, BlinkMacSystemFont, sans-serif;
+    font-size: 15px;
+    font-weight: 600;
+    text-align: center;
+    max-width: 320px;
+    line-height: 1.5;
+  `;
+  label.textContent = statusText || 'Loading all messages…';
+
+  /* Sub-label */
+  const sub = document.createElement('div');
+  sub.style.cssText = `
+    color: rgba(255,255,255,0.45);
+    font-family: -apple-system, BlinkMacSystemFont, sans-serif;
+    font-size: 12px;
+    text-align: center;
+  `;
+  sub.textContent = 'Please wait — do not click or scroll';
+
+  _overlay.appendChild(spinner);
+  _overlay.appendChild(label);
+  _overlay.appendChild(sub);
+  document.body.appendChild(_overlay);
+}
+
+function updateOverlay(text) {
+  const el = document.getElementById('owui-overlay-label');
+  if (el) el.textContent = text;
+}
+
+function hideOverlay() {
+  if (_overlay) { _overlay.remove(); _overlay = null; }
 }
 
 /* ─── HTML → Markdown (shared) ─── */
@@ -116,23 +200,43 @@ function cleanMarkdown(md) {
    PERPLEXITY SCRAPER
    ══════════════════════════════════════════════════════════ */
 
+/**
+ * Scrolls the page from top → bottom in chunks so Perplexity's
+ * virtual DOM mounts every chat turn. Updates the overlay label
+ * with a live step counter so the user knows progress.
+ */
 async function scrollToLoadAll() {
+  /* Try the inner scrollable thread container first, fall back to window */
   const container =
     document.querySelector('[class*="thread"], [class*="conversation"], main') ||
     document.documentElement;
+
+  const sleep = ms => new Promise(r => setTimeout(r, ms));
+
+  /* ── Step 1: jump to very top to mount oldest messages ── */
+  updateOverlay('📜 Scrolling to top to load oldest messages…');
   container.scrollTo({ top: 0, behavior: 'smooth' });
-  await new Promise(r => setTimeout(r, 1200));
-  const total = container.scrollHeight;
-  const step  = Math.ceil(total / 6);
-  for (let pos = step; pos < total; pos += step) {
+  await sleep(1400);
+
+  /* ── Step 2: scroll down in 10 equal steps ── */
+  const STEPS = 10;
+  for (let step = 1; step <= STEPS; step++) {
+    /* Re-read scrollHeight every iteration — it can grow as new turns mount */
+    const pos = Math.ceil((container.scrollHeight / STEPS) * step);
+    updateOverlay(`📜 Loading messages… (${step}/${STEPS})`);
     container.scrollTo({ top: pos, behavior: 'smooth' });
-    await new Promise(r => setTimeout(r, 600));
+    await sleep(700);
   }
+
+  /* ── Step 3: land at absolute bottom and give a final settle ── */
+  updateOverlay('⏳ Finalising…');
   container.scrollTo({ top: container.scrollHeight, behavior: 'smooth' });
-  await new Promise(r => setTimeout(r, 800));
+  await sleep(900);
 }
 
+/** Click every "Show More" button inside user messages */
 async function expandAllShowMore() {
+  updateOverlay('🔍 Expanding collapsed messages…');
   const btns = Array.from(document.querySelectorAll('button'))
     .filter(b => /^show\s*more$/i.test(b.innerText.trim()));
   for (const b of btns) {
@@ -155,7 +259,7 @@ function isPerplexityUIText(text) {
     /^pro search$/i.test(t) ||
     /^focus:/i.test(t) ||
     /^\d+\s+steps?\s+completed/i.test(t) ||
-    /^(\ud83d\ude80|⬇|⏳|✅|❌)/.test(t) ||
+    /^(🚀|⬇|⏳|✅|❌)/.test(t) ||
     t.length < 4
   );
 }
@@ -222,6 +326,9 @@ function scrapeSearchQueriesNear(proseEl) {
 async function scrapePerplexity() {
   await scrollToLoadAll();
   await expandAllShowMore();
+
+  updateOverlay('🔄 Reading messages…');
+  await new Promise(r => setTimeout(r, 200));
 
   const messages = [], now = Math.floor(Date.now() / 1000);
   let proseEls = Array.from(document.querySelectorAll('.prose'))
@@ -446,9 +553,11 @@ function buildExportData(messages) {
    ══════════════════════════════════════════════════════════ */
 
 async function exportChat() {
-  btn.innerText = '⏳ Loading all messages...';
+  showOverlay('📜 Preparing to load all messages…');
+  btn.innerText = '⏳ Loading…';
   try {
     const messages = await scrapeChat();
+    hideOverlay();
     if (!messages || !messages.length) {
       alert('❌ No messages found!\n\nMake sure the full conversation is visible on screen.');
       btn.innerText = '⬇ Download JSON';
@@ -464,13 +573,15 @@ async function exportChat() {
     document.body.removeChild(a);
     URL.revokeObjectURL(url);
     btn.innerText = `✅ ${messages.length} msgs · ${modelName}`;
-    setTimeout(() => { btn.innerText = '⬇ Download JSON'; }, 3000);
+    setTimeout(() => { btn.innerText = '⬇ Download JSON'; }, 3500);
   } catch (e) {
+    hideOverlay();
     btn.innerText = '⬇ Download JSON';
     alert(`❌ Export error:\n${e.message}`);
   }
 }
 
+/* ── Container ── */
 const container = document.createElement('div');
 container.id = 'owui-btn-container';
 container.style.cssText = `
@@ -478,6 +589,7 @@ container.style.cssText = `
   display:flex; flex-direction:column; gap:9px; align-items:flex-end;
 `;
 
+/* ── 🚀 Send to Open WebUI ── */
 const sendBtn = document.createElement('button');
 sendBtn.id = 'owui-send-btn';
 sendBtn.innerText = '🚀 Send to Open WebUI';
@@ -502,20 +614,29 @@ sendBtn.onclick = async () => {
       alert('⚠ Open WebUI URL or API token not set!\nClick the extension icon → ⚙️ Settings to configure.');
       return;
     }
-    sendBtn.innerText = '⏳ Loading all messages...';
+
+    showOverlay('📜 Preparing to load all messages…');
     sendBtn.disabled = true;
+    sendBtn.innerText = '⏳ Loading…';
+
     const messages = await scrapeChat();
+
     if (!messages || !messages.length) {
+      hideOverlay();
       sendBtn.disabled = false;
       sendBtn.innerText = '🚀 Send to Open WebUI';
       alert('❌ No messages found. Make sure the full chat is visible.');
       return;
     }
+
+    updateOverlay(`✅ Got ${messages.length} messages — sending to Open WebUI…`);
+    sendBtn.innerText = '⏳ Sending…';
     const { chat } = buildExportData(messages);
-    sendBtn.innerText = '⏳ Sending...';
+
     chrome.runtime.sendMessage(
       { action: 'importToOWUI', domain: owuiDomain, token: owuiToken, chat },
       (response) => {
+        hideOverlay();
         sendBtn.disabled = false;
         if (response?.success) {
           sendBtn.innerText = `✅ Sent! (${messages.length} msgs)`;
@@ -527,6 +648,7 @@ sendBtn.onclick = async () => {
       }
     );
   } catch (err) {
+    hideOverlay();
     sendBtn.disabled = false;
     sendBtn.innerText = '🚀 Send to Open WebUI';
     if (err.message?.includes('Extension context invalidated') ||
@@ -538,6 +660,7 @@ sendBtn.onclick = async () => {
   }
 };
 
+/* ── ⬇ Download JSON ── */
 const btn = document.createElement('button');
 btn.id = 'owui-export-btn';
 btn.innerText = '⬇ Download JSON';
@@ -556,6 +679,7 @@ btn.onclick = exportChat;
 container.appendChild(sendBtn);
 container.appendChild(btn);
 
+/* ── Inject on load + re-inject on SPA navigation ── */
 const inject = () => {
   if (!PLATFORM) return;
   if (!document.getElementById('owui-btn-container')) document.body.appendChild(container);

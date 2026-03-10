@@ -1,5 +1,5 @@
 /* ═══════════════════════════════════════════════════════════════
-   AI Chat → Open WebUI Importer  —  content.js  v2.2
+   AI Chat → Open WebUI Importer  —  content.js  v2.3
    Platforms : Perplexity · ChatGPT · Google Gemini · Claude
    ═══════════════════════════════════════════════════════════════ */
 
@@ -22,83 +22,93 @@ function generateUUID() {
 }
 
 /* ═══════════════════════════════════════════════════════════════
-   OVERLAY — blocks all interaction while auto-scroll runs
+   OVERLAY — blocks all interaction during scroll + export
    ═══════════════════════════════════════════════════════════════ */
 
 let _overlay = null;
 
 function showOverlay(statusText) {
   if (_overlay) { updateOverlay(statusText); return; }
-
   _overlay = document.createElement('div');
   _overlay.id = 'owui-overlay';
   _overlay.style.cssText = `
-    position: fixed;
-    inset: 0;
-    z-index: 2147483647;
-    background: rgba(0, 0, 0, 0.72);
-    backdrop-filter: blur(3px);
-    display: flex;
-    flex-direction: column;
-    align-items: center;
-    justify-content: center;
-    gap: 18px;
-    pointer-events: all;
-    cursor: not-allowed;
+    position:fixed; inset:0; z-index:2147483647;
+    background:rgba(0,0,0,0.75);
+    backdrop-filter:blur(4px);
+    display:flex; flex-direction:column;
+    align-items:center; justify-content:center; gap:16px;
+    pointer-events:all; cursor:not-allowed;
   `;
 
-  /* Spinner */
-  const spinner = document.createElement('div');
-  spinner.id = 'owui-spinner';
-  spinner.style.cssText = `
-    width: 52px; height: 52px;
-    border: 4px solid rgba(255,255,255,0.15);
-    border-top-color: #10b981;
-    border-radius: 50%;
-    animation: owui-spin 0.8s linear infinite;
-  `;
-
-  /* inject keyframes once */
   if (!document.getElementById('owui-keyframes')) {
-    const style = document.createElement('style');
-    style.id = 'owui-keyframes';
-    style.textContent = `@keyframes owui-spin { to { transform: rotate(360deg); } }`;
-    document.head.appendChild(style);
+    const s = document.createElement('style');
+    s.id = 'owui-keyframes';
+    s.textContent = `
+      @keyframes owui-spin  { to { transform:rotate(360deg); } }
+      @keyframes owui-pulse { 0%,100%{opacity:.6} 50%{opacity:1} }
+    `;
+    document.head.appendChild(s);
   }
 
-  /* Status label */
+  const spinner = document.createElement('div');
+  spinner.style.cssText = `
+    width:54px; height:54px;
+    border:4px solid rgba(255,255,255,0.12);
+    border-top-color:#10b981;
+    border-radius:50%;
+    animation:owui-spin 0.75s linear infinite;
+  `;
+
   const label = document.createElement('div');
   label.id = 'owui-overlay-label';
   label.style.cssText = `
-    color: #e2e8f0;
-    font-family: -apple-system, BlinkMacSystemFont, sans-serif;
-    font-size: 15px;
-    font-weight: 600;
-    text-align: center;
-    max-width: 320px;
-    line-height: 1.5;
+    color:#e2e8f0; font-family:-apple-system,BlinkMacSystemFont,sans-serif;
+    font-size:15px; font-weight:700; text-align:center;
+    max-width:340px; line-height:1.55;
   `;
   label.textContent = statusText || 'Loading all messages…';
 
-  /* Sub-label */
   const sub = document.createElement('div');
+  sub.id = 'owui-overlay-sub';
   sub.style.cssText = `
-    color: rgba(255,255,255,0.45);
-    font-family: -apple-system, BlinkMacSystemFont, sans-serif;
-    font-size: 12px;
-    text-align: center;
+    color:rgba(255,255,255,0.4);
+    font-family:-apple-system,BlinkMacSystemFont,sans-serif;
+    font-size:12px; text-align:center;
+    animation:owui-pulse 2s ease-in-out infinite;
   `;
-  sub.textContent = 'Please wait — do not click or scroll';
+  sub.textContent = 'Please wait — do not click or scroll the page';
+
+  /* progress bar */
+  const track = document.createElement('div');
+  track.style.cssText = `
+    width:260px; height:5px;
+    background:rgba(255,255,255,0.1);
+    border-radius:999px; overflow:hidden; margin-top:4px;
+  `;
+  const fill = document.createElement('div');
+  fill.id = 'owui-overlay-progress';
+  fill.style.cssText = `
+    height:100%; width:0%;
+    background:linear-gradient(90deg,#059669,#10b981);
+    border-radius:999px;
+    transition:width 0.35s ease;
+  `;
+  track.appendChild(fill);
 
   _overlay.appendChild(spinner);
   _overlay.appendChild(label);
   _overlay.appendChild(sub);
+  _overlay.appendChild(track);
   document.body.appendChild(_overlay);
 }
 
-function updateOverlay(text) {
-  const el = document.getElementById('owui-overlay-label');
-  if (el) el.textContent = text;
+function updateOverlay(text, pct) {
+  const l = document.getElementById('owui-overlay-label');
+  if (l) l.textContent = text;
+  if (pct !== undefined) {
+    const f = document.getElementById('owui-overlay-progress');
+    if (f) f.style.width = pct + '%';
+  }
 }
 
 function hideOverlay() {
@@ -196,47 +206,96 @@ function cleanMarkdown(md) {
   return md.replace(/\n{3,}/g, '\n\n').trim();
 }
 
-/* ══════════════════════════════════════════════════════════
-   PERPLEXITY SCRAPER
-   ══════════════════════════════════════════════════════════ */
+/* ═══════════════════════════════════════════════════════════════
+   PERPLEXITY — DOUBLE-PASS SCROLL WITH DOM STABILITY CHECK
 
-/**
- * Scrolls the page from top → bottom in chunks so Perplexity's
- * virtual DOM mounts every chat turn. Updates the overlay label
- * with a live step counter so the user knows progress.
- */
+   Strategy:
+     PASS 1 → top-to-bottom (12 steps, 600 ms each)
+     Stability check → count .prose nodes; wait 1 s; recount.
+       If count grew → do PASS 2 immediately.
+     PASS 2 → top-to-bottom again (12 steps, 550 ms each)
+     Final settle → sit at bottom for 1 s, then scrape.
+
+   This guarantees every virtualised chat-turn is mounted before
+   we read the DOM — even on very long (50+ message) threads.
+   ═══════════════════════════════════════════════════════════════ */
+
+function countProseNodes() {
+  return document.querySelectorAll('.prose, [data-testid="answer-text"]').length;
+}
+
+async function doScrollPass(container, passNum, totalPasses, stepCount, stepDelay) {
+  const sleep = ms => new Promise(r => setTimeout(r, ms));
+  const passPct  = (passNum - 1) / totalPasses;   // 0 for pass1, 0.5 for pass2
+  const passSpan = 1 / totalPasses;                // 0.5 each
+
+  /* always start from top so middle sections get remounted */
+  updateOverlay(
+    `🔄 Pass ${passNum}/${totalPasses} — scrolling to top…`,
+    Math.round(passPct * 80)   // reserve last 20 % for finalise
+  );
+  container.scrollTo({ top: 0, behavior: 'smooth' });
+  await sleep(1200);
+
+  for (let step = 1; step <= stepCount; step++) {
+    const pct = Math.round((passPct + (step / stepCount) * passSpan) * 80);
+    updateOverlay(
+      `🔄 Pass ${passNum}/${totalPasses} — loading messages… (${step}/${stepCount})`,
+      pct
+    );
+    /* Re-read scrollHeight every tick — page can grow as nodes mount */
+    const pos = Math.ceil((container.scrollHeight / stepCount) * step);
+    container.scrollTo({ top: pos, behavior: 'smooth' });
+    await sleep(stepDelay);
+  }
+
+  /* land at absolute bottom */
+  container.scrollTo({ top: container.scrollHeight, behavior: 'smooth' });
+  await sleep(800);
+}
+
 async function scrollToLoadAll() {
-  /* Try the inner scrollable thread container first, fall back to window */
+  const sleep = ms => new Promise(r => setTimeout(r, ms));
+
+  /* prefer inner scrollable container; fall back to documentElement */
   const container =
     document.querySelector('[class*="thread"], [class*="conversation"], main') ||
     document.documentElement;
 
-  const sleep = ms => new Promise(r => setTimeout(r, ms));
+  /* ── PASS 1 ── */
+  await doScrollPass(container, 1, 2, 12, 600);
 
-  /* ── Step 1: jump to very top to mount oldest messages ── */
-  updateOverlay('📜 Scrolling to top to load oldest messages…');
-  container.scrollTo({ top: 0, behavior: 'smooth' });
-  await sleep(1400);
+  /* ── DOM STABILITY CHECK ── */
+  updateOverlay('🔍 Verifying all messages loaded…', 42);
+  const countBefore = countProseNodes();
+  await sleep(1200);
+  const countAfter  = countProseNodes();
 
-  /* ── Step 2: scroll down in 10 equal steps ── */
-  const STEPS = 10;
-  for (let step = 1; step <= STEPS; step++) {
-    /* Re-read scrollHeight every iteration — it can grow as new turns mount */
-    const pos = Math.ceil((container.scrollHeight / STEPS) * step);
-    updateOverlay(`📜 Loading messages… (${step}/${STEPS})`);
-    container.scrollTo({ top: pos, behavior: 'smooth' });
-    await sleep(700);
-  }
+  const newNodesFound = countAfter > countBefore;
+  updateOverlay(
+    newNodesFound
+      ? `⚠️ Found ${countAfter - countBefore} new messages — running verification pass…`
+      : `✅ DOM stable (${countAfter} blocks found) — verifying with pass 2…`,
+    44
+  );
+  await sleep(600);
 
-  /* ── Step 3: land at absolute bottom and give a final settle ── */
-  updateOverlay('⏳ Finalising…');
+  /* ── PASS 2 (always, for certainty) ── */
+  await doScrollPass(container, 2, 2, 12, 550);
+
+  /* ── FINAL SETTLE ── */
+  updateOverlay('⏳ Final check — settling DOM…', 85);
   container.scrollTo({ top: container.scrollHeight, behavior: 'smooth' });
-  await sleep(900);
+  await sleep(1000);
+
+  /* scroll back to top so user sees the full chat after overlay closes */
+  container.scrollTo({ top: 0, behavior: 'smooth' });
+  await sleep(400);
 }
 
-/** Click every "Show More" button inside user messages */
+/* ─── Expand Show More buttons ─── */
 async function expandAllShowMore() {
-  updateOverlay('🔍 Expanding collapsed messages…');
+  updateOverlay('🔍 Expanding collapsed messages…', 88);
   const btns = Array.from(document.querySelectorAll('button'))
     .filter(b => /^show\s*more$/i.test(b.innerText.trim()));
   for (const b of btns) {
@@ -245,6 +304,7 @@ async function expandAllShowMore() {
   }
 }
 
+/* ─── Perplexity helpers ─── */
 function isPerplexityUIText(text) {
   const t = text.trim();
   return (
@@ -327,8 +387,8 @@ async function scrapePerplexity() {
   await scrollToLoadAll();
   await expandAllShowMore();
 
-  updateOverlay('🔄 Reading messages…');
-  await new Promise(r => setTimeout(r, 200));
+  updateOverlay('🔄 Reading all messages…', 93);
+  await new Promise(r => setTimeout(r, 300));
 
   const messages = [], now = Math.floor(Date.now() / 1000);
   let proseEls = Array.from(document.querySelectorAll('.prose'))
@@ -392,10 +452,7 @@ function scrapeModelPerplexity() {
   return 'perplexity-sonar';
 }
 
-/* ══════════════════════════════════════════════════════════
-   CHATGPT SCRAPER
-   ══════════════════════════════════════════════════════════ */
-
+/* ════════════════════ CHATGPT ════════════════════ */
 function scrapeChatGPT() {
   const messages = [], now = Math.floor(Date.now() / 1000);
   const turns = Array.from(document.querySelectorAll('article[data-testid^="conversation-turn"]'));
@@ -419,7 +476,6 @@ function scrapeChatGPT() {
   });
   return messages.length ? messages : null;
 }
-
 function scrapeModelChatGPT() {
   for (const sel of [
     'button[data-testid="model-switcher-dropdown-button"]',
@@ -433,10 +489,7 @@ function scrapeModelChatGPT() {
   return m ? m[0] : 'gpt-4o';
 }
 
-/* ══════════════════════════════════════════════════════════
-   GEMINI SCRAPER
-   ══════════════════════════════════════════════════════════ */
-
+/* ════════════════════ GEMINI ════════════════════ */
 function scrapeGemini() {
   const messages = [], now = Math.floor(Date.now() / 1000);
   const userEls  = Array.from(document.querySelectorAll(
@@ -458,7 +511,6 @@ function scrapeGemini() {
   }
   return messages.length ? messages : null;
 }
-
 function scrapeModelGemini() {
   for (const sel of ['[data-test-id="model-selector"] button','button[aria-label*="Gemini" i]','[class*="model-name"]']) {
     const el = document.querySelector(sel);
@@ -471,10 +523,7 @@ function scrapeModelGemini() {
   return 'gemini';
 }
 
-/* ══════════════════════════════════════════════════════════
-   CLAUDE SCRAPER
-   ══════════════════════════════════════════════════════════ */
-
+/* ════════════════════ CLAUDE ════════════════════ */
 function scrapeClaude() {
   const messages = [], now = Math.floor(Date.now() / 1000);
   const userEls = Array.from(document.querySelectorAll(
@@ -496,7 +545,6 @@ function scrapeClaude() {
   }
   return messages.length ? messages : null;
 }
-
 function scrapeModelClaude() {
   for (const sel of ['[data-testid="model-selector"]','button[aria-label*="claude" i]','[class*="ModelName"]','header [class*="model"]']) {
     const el = document.querySelector(sel);
@@ -509,10 +557,7 @@ function scrapeModelClaude() {
   return 'claude';
 }
 
-/* ══════════════════════════════════════════════════════════
-   UNIFIED DISPATCHER
-   ══════════════════════════════════════════════════════════ */
-
+/* ════════════════════ DISPATCHER ════════════════════ */
 async function scrapeChat() {
   switch (PLATFORM) {
     case 'perplexity': return await scrapePerplexity();
@@ -522,7 +567,6 @@ async function scrapeChat() {
     default:           return null;
   }
 }
-
 function scrapeModelName() {
   switch (PLATFORM) {
     case 'perplexity': return scrapeModelPerplexity();
@@ -532,31 +576,34 @@ function scrapeModelName() {
     default:           return 'unknown-model';
   }
 }
-
 function buildExportData(messages) {
   const modelName = scrapeModelName();
   const title = document.title
     .replace(/[-|]\s*(Perplexity|ChatGPT|Gemini|Claude).*$/i, '').trim() || 'Imported Chat';
-  const chat = {
-    id: generateUUID(), title,
-    timestamp: Math.floor(Date.now() / 1000),
-    models: [modelName],
-    messages: messages.map(msg => ({
-      ...msg, ...(msg.role === 'assistant' ? { model: modelName } : {})
-    }))
+  return {
+    chat: {
+      id: generateUUID(), title,
+      timestamp: Math.floor(Date.now() / 1000),
+      models: [modelName],
+      messages: messages.map(msg => ({
+        ...msg, ...(msg.role === 'assistant' ? { model: modelName } : {})
+      }))
+    },
+    modelName
   };
-  return { chat, modelName };
 }
 
-/* ══════════════════════════════════════════════════════════
+/* ═══════════════════════════════════════════════════════════════
    BUTTONS
-   ══════════════════════════════════════════════════════════ */
+   ═══════════════════════════════════════════════════════════════ */
 
 async function exportChat() {
-  showOverlay('📜 Preparing to load all messages…');
+  showOverlay('📜 Starting — this takes ~25 seconds for long chats…');
   btn.innerText = '⏳ Loading…';
   try {
     const messages = await scrapeChat();
+    updateOverlay(`✅ Found ${messages?.length ?? 0} messages — saving file…`, 98);
+    await new Promise(r => setTimeout(r, 300));
     hideOverlay();
     if (!messages || !messages.length) {
       alert('❌ No messages found!\n\nMake sure the full conversation is visible on screen.');
@@ -581,7 +628,6 @@ async function exportChat() {
   }
 }
 
-/* ── Container ── */
 const container = document.createElement('div');
 container.id = 'owui-btn-container';
 container.style.cssText = `
@@ -589,7 +635,6 @@ container.style.cssText = `
   display:flex; flex-direction:column; gap:9px; align-items:flex-end;
 `;
 
-/* ── 🚀 Send to Open WebUI ── */
 const sendBtn = document.createElement('button');
 sendBtn.id = 'owui-send-btn';
 sendBtn.innerText = '🚀 Send to Open WebUI';
@@ -614,13 +659,10 @@ sendBtn.onclick = async () => {
       alert('⚠ Open WebUI URL or API token not set!\nClick the extension icon → ⚙️ Settings to configure.');
       return;
     }
-
-    showOverlay('📜 Preparing to load all messages…');
+    showOverlay('📜 Starting — this takes ~25 seconds for long chats…');
     sendBtn.disabled = true;
     sendBtn.innerText = '⏳ Loading…';
-
     const messages = await scrapeChat();
-
     if (!messages || !messages.length) {
       hideOverlay();
       sendBtn.disabled = false;
@@ -628,11 +670,9 @@ sendBtn.onclick = async () => {
       alert('❌ No messages found. Make sure the full chat is visible.');
       return;
     }
-
-    updateOverlay(`✅ Got ${messages.length} messages — sending to Open WebUI…`);
+    updateOverlay(`✅ Found ${messages.length} messages — sending to Open WebUI…`, 98);
     sendBtn.innerText = '⏳ Sending…';
     const { chat } = buildExportData(messages);
-
     chrome.runtime.sendMessage(
       { action: 'importToOWUI', domain: owuiDomain, token: owuiToken, chat },
       (response) => {
@@ -660,7 +700,6 @@ sendBtn.onclick = async () => {
   }
 };
 
-/* ── ⬇ Download JSON ── */
 const btn = document.createElement('button');
 btn.id = 'owui-export-btn';
 btn.innerText = '⬇ Download JSON';
@@ -679,7 +718,6 @@ btn.onclick = exportChat;
 container.appendChild(sendBtn);
 container.appendChild(btn);
 
-/* ── Inject on load + re-inject on SPA navigation ── */
 const inject = () => {
   if (!PLATFORM) return;
   if (!document.getElementById('owui-btn-container')) document.body.appendChild(container);

@@ -1,0 +1,32 @@
+{
+  "manifest_version": 3,
+  "name": "AI Chat \u2192 Open WebUI Importer",
+  "description": "Import chats from Perplexity, ChatGPT, Gemini & Claude into Open WebUI",
+  "version": "2.1",
+  "permissions": ["storage", "activeTab", "scripting"],
+  "host_permissions": [
+    "https://www.perplexity.ai/*",
+    "https://chatgpt.com/*",
+    "https://chat.openai.com/*",
+    "https://gemini.google.com/*",
+    "https://claude.ai/*"
+  ],
+  "content_scripts": [{
+    "matches": [
+      "https://www.perplexity.ai/*",
+      "https://chatgpt.com/*",
+      "https://chat.openai.com/*",
+      "https://gemini.google.com/*",
+      "https://claude.ai/*"
+    ],
+    "js": ["content.js"],
+    "run_at": "document_idle"
+  }],
+  "background": {
+    "service_worker": "background.js"
+  },
+  "action": {
+    "default_popup": "popup.html",
+    "default_title": "AI Chat \u2192 Open WebUI"
+  }
+}
